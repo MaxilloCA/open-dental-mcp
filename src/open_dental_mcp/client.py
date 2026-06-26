@@ -53,6 +53,74 @@ DEFAULT_MAX_RETRY_DELAY = 30.0
 RETRYABLE_STATUS_CODES = frozenset({429, 500, 502, 503, 504})
 
 
+# --- HTTP status → exception dispatch ---------------------------------------
+
+
+from collections.abc import Callable  # noqa: E402
+
+
+def _extract_request_id(response: httpx.Response) -> str | None:
+    rid = (
+        response.headers.get("x-request-id")
+        or response.headers.get("x-amzn-requestid")
+        or response.headers.get("request-id")
+    )
+    return str(rid) if rid is not None else None
+
+
+def _safe_json_or_text(response: httpx.Response) -> Any:
+    try:
+        return response.json()
+    except ValueError:
+        return response.text
+
+
+def _parse_retry_after(response: httpx.Response) -> float | None:
+    with contextlib.suppress(ValueError, TypeError):
+        ra_header = response.headers.get("retry-after")
+        if ra_header:
+            return float(ra_header)
+    return None
+
+
+def _msg_auth_401(_: httpx.Response) -> str:
+    return "Open Dental rejected the credentials (HTTP 401)."
+
+
+def _msg_auth_403(_: httpx.Response) -> str:
+    return (
+        "Open Dental denied access (HTTP 403). "
+        "Check your key permissions in the Developer Portal."
+    )
+
+
+def _msg_not_found(r: httpx.Response) -> str:
+    return f"Open Dental resource not found: {r.url}"
+
+
+def _msg_rate_limit(_: httpx.Response) -> str:
+    return "Open Dental rate limit hit (HTTP 429). Slow down."
+
+
+def _msg_server_error(r: httpx.Response) -> str:
+    return f"Open Dental server error (HTTP {r.status_code})"
+
+
+_STATUS_DISPATCH: list[
+    tuple[
+        Callable[[int], bool],
+        type[OpenDentalError],
+        Callable[[httpx.Response], str],
+    ]
+] = [
+    (lambda c: c == 401, OpenDentalAuthError, _msg_auth_401),
+    (lambda c: c == 403, OpenDentalAuthError, _msg_auth_403),
+    (lambda c: c == 404, OpenDentalNotFoundError, _msg_not_found),
+    (lambda c: c == 429, OpenDentalRateLimitError, _msg_rate_limit),
+    (lambda c: 500 <= c < 600, OpenDentalAPIError, _msg_server_error),
+]
+
+
 # --- Internal helpers ------------------------------------------------------
 
 
@@ -144,57 +212,33 @@ class OpenDentalClient:
     # --- Request execution ----------------------------------------------------
 
     def _raise_for_status(self, response: httpx.Response) -> None:
-        request_id = (
-            response.headers.get("x-request-id")
-            or response.headers.get("x-amzn-requestid")
-            or response.headers.get("request-id")
-        )
-        try:
-            body = response.json()
-        except ValueError:
-            body = response.text
+        """Map a non-2xx response to the most specific typed exception.
 
-        if response.status_code == 401:
-            raise OpenDentalAuthError(
-                "Open Dental rejected the credentials (HTTP 401).",
-                http_status=401,
-                request_id=request_id,
-                body=body,
-            )
-        if response.status_code == 403:
-            raise OpenDentalAuthError(
-                "Open Dental denied access (HTTP 403). "
-                "Check your key permissions in the Developer Portal.",
-                http_status=403,
-                request_id=request_id,
-                body=body,
-            )
-        if response.status_code == 404:
-            raise OpenDentalNotFoundError(
-                f"Open Dental resource not found: {response.url}",
-                http_status=404,
-                request_id=request_id,
-                body=body,
-            )
-        if response.status_code == 429:
-            retry_after: float | None = None
-            with contextlib.suppress(ValueError):
-                ra_header = response.headers.get("retry-after")
-                if ra_header:
-                    retry_after = float(ra_header)
-            raise OpenDentalRateLimitError(
-                "Open Dental rate limit hit (HTTP 429). Slow down.",
-                retry_after=retry_after,
-                request_id=request_id,
-                body=body,
-            )
-        if 500 <= response.status_code < 600:
-            raise OpenDentalAPIError(
-                f"Open Dental server error (HTTP {response.status_code})",
-                http_status=response.status_code,
-                request_id=request_id,
-                body=body,
-            )
+        Dispatch table maps HTTP status codes to (ExceptionClass, message
+        builder). Adding a new status code = one row, no new branches.
+        """
+        request_id = _extract_request_id(response)
+        body = _safe_json_or_text(response)
+        retry_after = _parse_retry_after(response)
+
+        for matcher, exc_cls, msg_fn in _STATUS_DISPATCH:
+            if matcher(response.status_code):
+                if exc_cls is OpenDentalRateLimitError:
+                    raise exc_cls(
+                        msg_fn(response),
+                        http_status=response.status_code,
+                        request_id=request_id,
+                        body=body,
+                        retry_after=retry_after,
+                    )
+                raise exc_cls(
+                    msg_fn(response),
+                    http_status=response.status_code,
+                    request_id=request_id,
+                    body=body,
+                )
+
+        # Fallback for any 3xx or other non-2xx we haven't classified.
         raise OpenDentalAPIError(
             f"Open Dental returned HTTP {response.status_code}",
             http_status=response.status_code,
