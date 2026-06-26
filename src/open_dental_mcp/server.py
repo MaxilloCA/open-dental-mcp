@@ -15,9 +15,20 @@ import json
 import sys
 from typing import Any
 
+import structlog
 from mcp.server.fastmcp import FastMCP
 
-from .client import OpenDentalAPIError, OpenDentalAuthError, OpenDentalClient, OpenDentalError
+from .client import OpenDentalClient
+from .exceptions import (
+    OpenDentalAPIError,
+    OpenDentalAuthError,
+    OpenDentalConnectionError,
+    OpenDentalError,
+    OpenDentalNotFoundError,
+    OpenDentalRateLimitError,
+)
+
+log = structlog.get_logger(__name__)
 
 
 def _format_error(e: Exception) -> str:
@@ -26,8 +37,16 @@ def _format_error(e: Exception) -> str:
             "Authentication failed against Open Dental. Verify OPENDENTAL_DEVELOPER_KEY "
             f"and OPENDENTAL_CUSTOMER_KEY. Details: {e}"
         )
+    if isinstance(e, OpenDentalNotFoundError):
+        return f"Resource not found: {e}"
+    if isinstance(e, OpenDentalRateLimitError):
+        wait = f" Retry in {e.retry_after}s." if e.retry_after else ""
+        return f"Open Dental rate limit hit.{wait} Slow down."
+    if isinstance(e, OpenDentalConnectionError):
+        return f"Network failure talking to Open Dental: {e}"
     if isinstance(e, OpenDentalAPIError):
-        return f"Open Dental API error (HTTP {e.status_code}): {e}"
+        request_id = f" (request_id: {e.request_id})" if e.request_id else ""
+        return f"Open Dental API error (HTTP {e.http_status}){request_id}: {e}"
     if isinstance(e, OpenDentalError):
         return f"Open Dental error: {e}"
     return f"Unexpected error: {e!r}"
@@ -300,7 +319,7 @@ def main() -> None:
     try:
         mcp.run()
     except OpenDentalAuthError as e:
-        print(f"[open-dental-mcp] {e}", file=sys.stderr)
+        log.error("server.auth_failed_on_start", error=str(e))
         sys.exit(1)
 
 

@@ -3,35 +3,65 @@
 Uses Open Dental's REST API. Authentication is two API keys (developer +
 customer) joined with a slash in the ``Authorization: ODFHIR`` header.
 
+Built on industry-leading patterns (encode/httpx, stripe-python):
+- **Shared ``httpx.AsyncClient``** with connection pooling + transport retries.
+- **Typed exception hierarchy** with structured fields. See ``exceptions.py``.
+- **Application-level retry** with exponential backoff + full jitter.
+
 Docs: https://www.opendental.com/site/apispecification.html
 """
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import os
+import random
+import time
 from typing import Any
 
 import httpx
+import structlog
 
+from . import __version__
+from .exceptions import (
+    OpenDentalAPIError,
+    OpenDentalAuthError,
+    OpenDentalConnectionError,
+    OpenDentalError,
+    OpenDentalNotFoundError,
+    OpenDentalRateLimitError,
+)
+
+log = structlog.get_logger(__name__)
+
+
+# --- Configuration constants -----------------------------------------------
 
 DEFAULT_BASE_URL = "https://api.opendental.com/api/v1"
 DEFAULT_TIMEOUT = 30.0
 
+# Connection pool sizing
+DEFAULT_MAX_CONNECTIONS = 100
+DEFAULT_MAX_KEEPALIVE_CONNECTIONS = 20
+DEFAULT_KEEPALIVE_EXPIRY = 30.0
 
-class OpenDentalError(RuntimeError):
-    """Base exception for Open Dental client errors."""
+# Application-level retry
+DEFAULT_MAX_RETRIES = 3
+DEFAULT_BASE_RETRY_DELAY = 0.5
+DEFAULT_MAX_RETRY_DELAY = 30.0
 
-    def __init__(self, message: str, status_code: int | None = None, body: Any = None) -> None:
-        super().__init__(message)
-        self.status_code = status_code
-        self.body = body
-
-
-class OpenDentalAuthError(OpenDentalError):
-    """Raised when credentials are missing, invalid, or unauthorized."""
+RETRYABLE_STATUS_CODES = frozenset({429, 500, 502, 503, 504})
 
 
-class OpenDentalAPIError(OpenDentalError):
-    """Raised on non-2xx API responses other than auth failures."""
+# --- Internal helpers ------------------------------------------------------
+
+
+def _retry_delay(attempt: int, retry_after: float | None = None) -> float:
+    """Exponential backoff with full jitter, clamped to [0.5, 30] seconds."""
+    if retry_after is not None:
+        return min(float(retry_after), DEFAULT_MAX_RETRY_DELAY)
+    delay = min(DEFAULT_BASE_RETRY_DELAY * (2 ** attempt), DEFAULT_MAX_RETRY_DELAY)
+    return float(delay * random.uniform(0.5, 1.0))  # full jitter
 
 
 class OpenDentalClient:
@@ -43,6 +73,11 @@ class OpenDentalClient:
 
     Set ``OPENDENTAL_DEVELOPER_KEY`` and ``OPENDENTAL_CUSTOMER_KEY`` env vars,
     or pass them to the constructor.
+
+    Use as an async context manager:
+
+        async with OpenDentalClient() as client:
+            await client.get_patient(12345)
     """
 
     def __init__(
@@ -52,6 +87,7 @@ class OpenDentalClient:
         *,
         base_url: str = DEFAULT_BASE_URL,
         timeout: float = DEFAULT_TIMEOUT,
+        max_retries: int = DEFAULT_MAX_RETRIES,
     ) -> None:
         developer_key = developer_key or os.environ.get("OPENDENTAL_DEVELOPER_KEY")
         customer_key = customer_key or os.environ.get("OPENDENTAL_CUSTOMER_KEY")
@@ -60,15 +96,111 @@ class OpenDentalClient:
                 "Open Dental credentials missing. Set OPENDENTAL_DEVELOPER_KEY and "
                 "OPENDENTAL_CUSTOMER_KEY environment variables, or pass them to the client."
             )
+        assert developer_key is not None
+        assert customer_key is not None
         self._auth_header = f"ODFHIR {developer_key}/{customer_key}"
         self._base_url = base_url.rstrip("/")
         self._timeout = timeout
+        self._max_retries = max_retries
 
-    def _headers(self) -> dict[str, str]:
-        return {
-            "Authorization": self._auth_header,
-            "Accept": "application/json",
-        }
+        # Build shared httpx.AsyncClient with pooling + transport retries.
+        transport = httpx.AsyncHTTPTransport(retries=3)
+        limits = httpx.Limits(
+            max_connections=DEFAULT_MAX_CONNECTIONS,
+            max_keepalive_connections=DEFAULT_MAX_KEEPALIVE_CONNECTIONS,
+            keepalive_expiry=DEFAULT_KEEPALIVE_EXPIRY,
+        )
+        timeout_obj = httpx.Timeout(
+            timeout,
+            connect=10.0,
+            read=timeout,
+            write=10.0,
+            pool=5.0,
+        )
+        self._client = httpx.AsyncClient(
+            base_url=self._base_url,
+            timeout=timeout_obj,
+            limits=limits,
+            transport=transport,
+            headers={
+                "Authorization": self._auth_header,
+                "Accept": "application/json",
+                "User-Agent": f"open-dental-mcp/{__version__}",
+            },
+            follow_redirects=False,
+        )
+
+    # --- Context manager ------------------------------------------------------
+
+    async def __aenter__(self) -> OpenDentalClient:
+        return self
+
+    async def __aexit__(self, *exc: object) -> None:
+        await self.aclose()
+
+    async def aclose(self) -> None:
+        await self._client.aclose()
+
+    # --- Request execution ----------------------------------------------------
+
+    def _raise_for_status(self, response: httpx.Response) -> None:
+        request_id = (
+            response.headers.get("x-request-id")
+            or response.headers.get("x-amzn-requestid")
+            or response.headers.get("request-id")
+        )
+        try:
+            body = response.json()
+        except ValueError:
+            body = response.text
+
+        if response.status_code == 401:
+            raise OpenDentalAuthError(
+                "Open Dental rejected the credentials (HTTP 401).",
+                http_status=401,
+                request_id=request_id,
+                body=body,
+            )
+        if response.status_code == 403:
+            raise OpenDentalAuthError(
+                "Open Dental denied access (HTTP 403). "
+                "Check your key permissions in the Developer Portal.",
+                http_status=403,
+                request_id=request_id,
+                body=body,
+            )
+        if response.status_code == 404:
+            raise OpenDentalNotFoundError(
+                f"Open Dental resource not found: {response.url}",
+                http_status=404,
+                request_id=request_id,
+                body=body,
+            )
+        if response.status_code == 429:
+            retry_after: float | None = None
+            with contextlib.suppress(ValueError):
+                ra_header = response.headers.get("retry-after")
+                if ra_header:
+                    retry_after = float(ra_header)
+            raise OpenDentalRateLimitError(
+                "Open Dental rate limit hit (HTTP 429). Slow down.",
+                retry_after=retry_after,
+                request_id=request_id,
+                body=body,
+            )
+        if 500 <= response.status_code < 600:
+            raise OpenDentalAPIError(
+                f"Open Dental server error (HTTP {response.status_code})",
+                http_status=response.status_code,
+                request_id=request_id,
+                body=body,
+            )
+        raise OpenDentalAPIError(
+            f"Open Dental returned HTTP {response.status_code}",
+            http_status=response.status_code,
+            request_id=request_id,
+            body=body,
+        )
 
     async def _request(
         self,
@@ -78,43 +210,81 @@ class OpenDentalClient:
         params: dict[str, Any] | None = None,
         json: Any = None,
     ) -> Any:
-        url = f"{self._base_url}{path}"
-        async with httpx.AsyncClient(timeout=self._timeout) as http:
-            response = await http.request(
-                method, url, params=params, json=json, headers=self._headers()
-            )
-
-        if response.status_code == 401:
-            raise OpenDentalAuthError(
-                "Open Dental rejected the credentials (HTTP 401).", 401
-            )
-        if response.status_code == 403:
-            raise OpenDentalAuthError(
-                "Open Dental denied access (HTTP 403). Check your key permissions in the Developer Portal.",
-                403,
-            )
-        if not 200 <= response.status_code < 300:
+        last_exc: OpenDentalError | None = None
+        for attempt in range(self._max_retries + 1):
+            log.info("request.start", method=method, path=path, attempt=attempt)
+            t0 = time.monotonic()
             try:
-                body = response.json()
-            except ValueError:
-                body = response.text
-            raise OpenDentalAPIError(
-                f"Open Dental returned HTTP {response.status_code}",
-                status_code=response.status_code,
-                body=body,
+                response = await self._client.request(method, path, params=params, json=json)
+            except httpx.HTTPError as exc:
+                duration_ms = (time.monotonic() - t0) * 1000
+                log.warning(
+                    "request.connection_error",
+                    method=method, path=path, error=str(exc),
+                    duration_ms=round(duration_ms, 1),
+                )
+                if attempt < self._max_retries:
+                    await asyncio.sleep(_retry_delay(attempt))
+                    continue
+                raise OpenDentalConnectionError(
+                    f"Network failure calling Open Dental {method} {path}: {exc}",
+                ) from exc
+
+            duration_ms = (time.monotonic() - t0) * 1000
+            log.info(
+                "request.end",
+                method=method, path=path, status=response.status_code,
+                duration_ms=round(duration_ms, 1),
             )
 
-        text = response.text
-        if not text:
-            return None
-        try:
-            return response.json()
-        except ValueError:
-            return text
+            if response.status_code in RETRYABLE_STATUS_CODES and attempt < self._max_retries:
+                retry_after: float | None = None
+                with contextlib.suppress(ValueError):
+                    ra_header = response.headers.get("retry-after")
+                    if ra_header:
+                        retry_after = float(ra_header)
+                delay = _retry_delay(attempt, retry_after)
+                log.warning(
+                    "request.retry",
+                    method=method, path=path, status=response.status_code,
+                    attempt=attempt, delay=round(delay, 2),
+                )
+                await asyncio.sleep(delay)
+                continue
+
+            if 200 <= response.status_code < 300:
+                text = response.text
+                if not text:
+                    return None
+                try:
+                    return response.json()
+                except ValueError:
+                    return text
+
+            try:
+                self._raise_for_status(response)
+            except OpenDentalRateLimitError as exc:
+                last_exc = exc
+                if attempt < self._max_retries:
+                    delay = _retry_delay(attempt, exc.retry_after)
+                    await asyncio.sleep(delay)
+                    continue
+                raise
+            except (OpenDentalAPIError, OpenDentalAuthError, OpenDentalNotFoundError):
+                raise
+            except OpenDentalError as exc:
+                last_exc = exc
+                if attempt < self._max_retries:
+                    await asyncio.sleep(_retry_delay(attempt))
+                    continue
+                raise
+
+        assert last_exc is not None
+        raise last_exc
 
     # ----- Patient workflows -------------------------------------------------
 
-    async def get_patient(self, patnum: int) -> dict[str, Any]:
+    async def get_patient(self, patnum: int) -> Any:
         """Fetch a single patient by PatNum."""
         return await self._request("GET", f"/patients/{patnum}")
 
@@ -127,11 +297,8 @@ class OpenDentalClient:
         email: str | None = None,
         birthdate: str | None = None,
         limit: int = 25,
-    ) -> list[dict[str, Any]]:
-        """Search for patients. At least one criterion should be provided.
-
-        Query params: LName, FName, Phone, Email, Birthdate.
-        """
+    ) -> Any:
+        """Search for patients. At least one criterion should be provided."""
         params: dict[str, Any] = {"Limit": limit}
         if lname:
             params["LName"] = lname
@@ -145,13 +312,13 @@ class OpenDentalClient:
             params["Birthdate"] = birthdate
         return await self._request("GET", "/patients", params=params)
 
-    async def update_patient(self, patnum: int, updates: dict[str, Any]) -> dict[str, Any]:
+    async def update_patient(self, patnum: int, updates: dict[str, Any]) -> Any:
         """Update fields on an existing patient record."""
         return await self._request("PUT", f"/patients/{patnum}", json=updates)
 
     # ----- Appointment workflows ---------------------------------------------
 
-    async def get_appointment(self, aptnum: int) -> dict[str, Any]:
+    async def get_appointment(self, aptnum: int) -> Any:
         """Fetch a single appointment."""
         return await self._request("GET", f"/appointments/{aptnum}")
 
@@ -165,12 +332,8 @@ class OpenDentalClient:
         provnum: int | None = None,
         clinicnum: int | None = None,
         limit: int = 50,
-    ) -> list[dict[str, Any]]:
-        """List appointments with optional filters.
-
-        Pass either ``date`` (single day, YYYY-MM-DD) or ``date_start`` +
-        ``date_end`` (range).
-        """
+    ) -> Any:
+        """List appointments with optional filters."""
         params: dict[str, Any] = {"Limit": limit}
         if date:
             params["Date"] = date
@@ -186,13 +349,13 @@ class OpenDentalClient:
             params["ClinicNum"] = clinicnum
         return await self._request("GET", "/appointments", params=params)
 
-    async def create_appointment(self, appointment: dict[str, Any]) -> dict[str, Any]:
+    async def create_appointment(self, appointment: dict[str, Any]) -> Any:
         """Create a new appointment."""
         return await self._request("POST", "/appointments", json=appointment)
 
     # ----- Providers --------------------------------------------------------
 
-    async def list_providers(self) -> list[dict[str, Any]]:
+    async def list_providers(self) -> Any:
         """List all providers."""
         return await self._request("GET", "/providers")
 
@@ -205,7 +368,7 @@ class OpenDentalClient:
         date_start: str | None = None,
         date_end: str | None = None,
         limit: int = 50,
-    ) -> list[dict[str, Any]]:
+    ) -> Any:
         """List procedure log entries."""
         params: dict[str, Any] = {"Limit": limit}
         if patnum is not None:
@@ -227,12 +390,8 @@ class OpenDentalClient:
         *,
         comm_mode: int | None = None,
         sent_or_received: int | None = None,
-    ) -> dict[str, Any]:
-        """Log a communication (phone call, email, etc.) to a patient record.
-
-        Open Dental uses integer codes for comm types and modes. See:
-        https://www.opendental.com/site/apicommlogs.html for the full table.
-        """
+    ) -> Any:
+        """Log a communication (phone call, email, etc.) to a patient record."""
         payload: dict[str, Any] = {
             "PatNum": patnum,
             "CommDateTime": comm_date,
@@ -255,7 +414,7 @@ class OpenDentalClient:
         due_date_end: str | None = None,
         recall_type: int | None = None,
         limit: int = 50,
-    ) -> list[dict[str, Any]]:
+    ) -> Any:
         """List recalls due for patients — useful for hygiene follow-up workflows."""
         params: dict[str, Any] = {"Limit": limit}
         if patnum is not None:
@@ -270,11 +429,11 @@ class OpenDentalClient:
 
     # ----- Clinics / Operatories --------------------------------------------
 
-    async def list_clinics(self) -> list[dict[str, Any]]:
+    async def list_clinics(self) -> Any:
         """List clinics (offices) under this developer account."""
         return await self._request("GET", "/clinics")
 
-    async def list_operatories(self, clinicnum: int | None = None) -> list[dict[str, Any]]:
+    async def list_operatories(self, clinicnum: int | None = None) -> Any:
         """List operatories (treatment rooms), optionally filtered by clinic."""
         params: dict[str, Any] = {}
         if clinicnum is not None:
@@ -283,6 +442,6 @@ class OpenDentalClient:
 
     # ----- Definitions / reference data -------------------------------------
 
-    async def list_appointment_types(self) -> list[dict[str, Any]]:
+    async def list_appointment_types(self) -> Any:
         """List appointment type definitions (cleaning, filling, etc.)."""
         return await self._request("GET", "/appointmenttypes")

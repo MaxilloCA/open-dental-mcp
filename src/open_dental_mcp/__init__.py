@@ -1,12 +1,25 @@
-"""Open Dental MCP — MCP server."""
-from .client import OpenDentalAPIError, OpenDentalAuthError, OpenDentalClient
+"""Open Dental MCP — public surface."""
+__version__ = "0.2.0"
+
+from .client import OpenDentalClient
+from .exceptions import (
+    OpenDentalAPIError,
+    OpenDentalAuthError,
+    OpenDentalConnectionError,
+    OpenDentalError,
+    OpenDentalNotFoundError,
+    OpenDentalRateLimitError,
+)
 from .server import main, mcp
 
-__version__ = "0.1.0"
 __all__ = [
     "OpenDentalAPIError",
     "OpenDentalAuthError",
     "OpenDentalClient",
+    "OpenDentalConnectionError",
+    "OpenDentalError",
+    "OpenDentalNotFoundError",
+    "OpenDentalRateLimitError",
     "main",
     "mcp",
 ]

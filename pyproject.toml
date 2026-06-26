@@ -1,7 +1,7 @@
 [project]
 name = "open_dental_mcp"
-version = "0.1.0"
-description = "<DESCRIPTION>"
+dynamic = ["version"]
+description = "MCP server for Open Dental \u2014 dental practice management API. Read patients, appointments, providers; log comms."
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
@@ -9,11 +9,37 @@ authors = [
     { name = "Sanjibani Choudhury", email = "schoudhury1991@gmail.com" },
 ]
 keywords = ["mcp", "model-context-protocol", "open_dental_mcp"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Typing :: Typed",
+]
 
 dependencies = [
     "mcp[cli]>=1.0.0",
     "httpx>=0.27.0",
     "pydantic>=2.5.0",
+    "structlog>=24.1.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.24.0",
+    "respx>=0.21.0",
+    "hypothesis>=6.100.0",
+    "ruff>=0.6.0",
+    "mypy>=1.10.0",
+    "coverage>=7.5.0",
 ]
 
 [project.scripts]
@@ -23,13 +49,53 @@ open_dental_mcp = "open_dental_mcp.server:main"
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
+[tool.hatch.version]
+path = "src/open_dental_mcp/__init__.py"
+
 [tool.hatch.build.targets.wheel]
 packages = ["src/open_dental_mcp"]
+include = ["src/open_dental_mcp/py.typed"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 python_files = "test_*.py"
+asyncio_mode = "auto"
+addopts = "-ra --strict-markers"
+
+[tool.coverage.run]
+source = ["src/open_dental_mcp"]
+branch = true
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = false
 
 [tool.ruff]
 line-length = 100
 target-version = "py310"
+extend-exclude = [".venv", "build", "dist"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "N", "UP", "B", "A", "C4", "DTZ", "T20", "PT", "Q", "RET", "SIM", "TID", "ARG", "PTH", "ERA", "PL", "RUF"]
+ignore = [
+    "PLR0913", "PLR2004", "PLR0911", "PLR0912", "PLR0915",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["PLR0913", "ARG", "PTH", "T20", "PLR0912", "PLR0915"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+
+[tool.mypy]
+python_version = "3.10"
+strict = true
+warn_unreachable = true
+warn_unused_ignores = true
+disallow_untyped_defs = true
+files = ["src/open_dental_mcp", "tests"]
+
+[[tool.mypy.overrides]]
+module = ["respx.*", "structlog.*"]
+ignore_missing_imports = true
