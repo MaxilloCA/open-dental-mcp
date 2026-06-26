@@ -80,8 +80,8 @@ async def get_patient(patnum: int) -> str:
     """Fetch a single patient by PatNum (Open Dental's internal patient ID)."""
     try:
         return _json(await _client().get_patient(patnum))
-    except OpenDentalError as e:
-        return _format_error(e)
+    except OpenDentalError:
+        raise
 
 
 @mcp.tool()
@@ -104,8 +104,8 @@ async def find_patients(
             birthdate=birthdate, limit=limit,
         )
         return _json({"count": len(results), "patients": results})
-    except OpenDentalError as e:
-        return _format_error(e)
+    except OpenDentalError:
+        raise
 
 
 @mcp.tool()
@@ -123,8 +123,8 @@ async def update_patient(patnum: int, updates_json: str) -> str:
         return _json(await _client().update_patient(patnum, updates))
     except json.JSONDecodeError as e:
         return f"Invalid JSON in updates_json: {e}"
-    except OpenDentalError as e:
-        return _format_error(e)
+    except OpenDentalError:
+        raise
 
 
 # ----- Appointment tools ----------------------------------------------------
@@ -151,8 +151,8 @@ async def find_appointments(
             patnum=patnum, provnum=provnum, clinicnum=clinicnum, limit=limit,
         )
         return _json({"count": len(results), "appointments": results})
-    except OpenDentalError as e:
-        return _format_error(e)
+    except OpenDentalError:
+        raise
 
 
 @mcp.tool()
@@ -160,8 +160,8 @@ async def get_appointment(aptnum: int) -> str:
     """Fetch a single appointment by AptNum."""
     try:
         return _json(await _client().get_appointment(aptnum))
-    except OpenDentalError as e:
-        return _format_error(e)
+    except OpenDentalError:
+        raise
 
 
 @mcp.tool()
@@ -179,8 +179,8 @@ async def create_appointment(appointment_json: str) -> str:
         return _json(await _client().create_appointment(data))
     except json.JSONDecodeError as e:
         return f"Invalid JSON in appointment_json: {e}"
-    except OpenDentalError as e:
-        return _format_error(e)
+    except OpenDentalError:
+        raise
 
 
 # ----- Provider / clinic tools ---------------------------------------------
@@ -191,8 +191,8 @@ async def list_providers() -> str:
     """List all providers (dentists + hygienists) in the practice."""
     try:
         return _json(await _client().list_providers())
-    except OpenDentalError as e:
-        return _format_error(e)
+    except OpenDentalError:
+        raise
 
 
 @mcp.tool()
@@ -200,8 +200,8 @@ async def list_clinics() -> str:
     """List clinics (offices) accessible to this developer account."""
     try:
         return _json(await _client().list_clinics())
-    except OpenDentalError as e:
-        return _format_error(e)
+    except OpenDentalError:
+        raise
 
 
 @mcp.tool()
@@ -209,8 +209,8 @@ async def list_operatories(clinicnum: int | None = None) -> str:
     """List operatories (treatment rooms). Optionally filter by clinic number."""
     try:
         return _json(await _client().list_operatories(clinicnum=clinicnum))
-    except OpenDentalError as e:
-        return _format_error(e)
+    except OpenDentalError:
+        raise
 
 
 @mcp.tool()
@@ -218,8 +218,8 @@ async def list_appointment_types() -> str:
     """List appointment type definitions (cleaning, filling, exam, etc.)."""
     try:
         return _json(await _client().list_appointment_types())
-    except OpenDentalError as e:
-        return _format_error(e)
+    except OpenDentalError:
+        raise
 
 
 # ----- Procedure tools ------------------------------------------------------
@@ -238,8 +238,8 @@ async def find_procedurelogs(
             patnum=patnum, date_start=date_start, date_end=date_end, limit=limit,
         )
         return _json({"count": len(results), "procedurelogs": results})
-    except OpenDentalError as e:
-        return _format_error(e)
+    except OpenDentalError:
+        raise
 
 
 # ----- Communication log tools ---------------------------------------------
@@ -275,8 +275,8 @@ async def log_communication(
             sent_or_received=sent_or_received,
         )
         return _json({"status": "ok", "commlog": result})
-    except OpenDentalError as e:
-        return _format_error(e)
+    except OpenDentalError:
+        raise
 
 
 # ----- Recall tools ---------------------------------------------------------
@@ -298,8 +298,8 @@ async def find_recalls(
             due_date_end=due_date_end, recall_type=recall_type, limit=limit,
         )
         return _json({"count": len(results), "recalls": results})
-    except OpenDentalError as e:
-        return _format_error(e)
+    except OpenDentalError:
+        raise
 
 
 # ----- Health check ---------------------------------------------------------
@@ -311,8 +311,8 @@ async def health_check() -> str:
     try:
         await _client().list_providers()
         return _json({"status": "ok"})
-    except OpenDentalError as e:
-        return _format_error(e)
+    except OpenDentalError:
+        raise
 
 
 def main() -> None:

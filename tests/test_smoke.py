@@ -269,3 +269,44 @@ def test_error_repr_includes_structured_fields() -> None:
     assert "http_status=500" in r
     assert "error_code='oops'" in r
     assert "request_id='req-1'" in r
+
+
+
+# --- Security regression: tools must raise (not return string) so FastMCP ---
+# sets isError=true. See the Blackwell Systems audit (54 MCPs / 20 bugs)
+# and MCPTox benchmark (arXiv:2508.14925): returning error strings as plain
+# content makes agents retry indefinitely. We verify our tools do NOT
+# regress to that pattern.
+#
+# Pattern: call the FastMCP server in-process, force a tool to encounter
+# a downstream error, assert that FastMCP sees a ToolError (which its
+# internal call_tool() handler converts to CallToolResult with isError=true).
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_tool_error_sets_iserror_true() -> None:
+    """FastMCP must wrap the raised exception → sets isError=true over the wire."""
+    # Set up creds for client construction
+    os.environ["OPENDENTAL_DEVELOPER_KEY"] = "dev"
+    os.environ["OPENDENTAL_CUSTOMER_KEY"] = "cust"
+
+    # Mock the OAuth refresh (if applicable) + a failing API call
+
+    respx.get("https://api.opendental.com/api/v1/providers").mock(
+        return_value=httpx.Response(401, text="")
+    )
+
+    from mcp.server.fastmcp.exceptions import ToolError
+
+    from open_dental_mcp import server as _open_dental_mcp_server
+
+    with pytest.raises(ToolError) as exc_info:
+        await _open_dental_mcp_server.mcp.call_tool("list_providers", {})
+
+    msg = str(exc_info.value)
+    assert "Open Dental rejected the credentials" in msg, (
+        f"Expected auth hint in the error; got: {msg!r}. "
+        "Returning error strings as plain content (the OLD pattern) loses "
+        "isError=true and the agent cannot tell the tool failed."
+    )
