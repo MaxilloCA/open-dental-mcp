@@ -148,7 +148,22 @@ pytest
 open_dental_mcp
 ```
 
-## License
+
+---
+
+## Need a custom MCP for your SaaS?
+
+I build production-grade MCP servers for vertical SaaS — insurance, dental, veterinary, legal, property mgmt, home services. Typical engagement: 2-4 weeks, $25K-$120K. Source-owned, MIT-licensed, no vendor lock-in.
+
+See [sanjibani/mcp-services](https://github.com/sanjibani/mcp-services) or email sanjibani@users.noreply.github.com.
+
+---
+
+*Ships in the [sanjibani vertical-MCP portfolio](https://github.com/sanjibani?q=-mcp) — see also [hawksoft-mcp](https://github.com/sanjibani/hawksoft-mcp), [open-dental-mcp](https://github.com/sanjibani/open-dental-mcp), [ezyvet-mcp](https://github.com/sanjibani/ezyvet-mcp), [jobber-mcp](https://github.com/sanjibani/jobber-mcp), [paid-skills](https://github.com/sanjibani/paid-skills), [mcp-vertical-template](https://github.com/sanjibani/mcp-vertical-template).*
+
+---
+
+
 
 MIT — see [LICENSE](LICENSE).
 
