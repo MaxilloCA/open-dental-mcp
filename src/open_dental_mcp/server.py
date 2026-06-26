@@ -9,6 +9,7 @@ Quick start:
     export OPENDENTAL_CUSTOMER_KEY=...
     open_dental_mcp
 """
+
 from __future__ import annotations
 
 import json
@@ -18,6 +19,7 @@ from typing import Any
 import structlog
 from mcp.server.fastmcp import FastMCP
 
+from .audit import audit_tool_call
 from .client import OpenDentalClient
 from .exceptions import (
     OpenDentalAPIError,
@@ -34,8 +36,8 @@ log = structlog.get_logger(__name__)
 def _format_error(e: Exception) -> str:
     if isinstance(e, OpenDentalAuthError):
         return (
-            "Authentication failed against Open Dental. Verify OPENDENTAL_DEVELOPER_KEY "
-            f"and OPENDENTAL_CUSTOMER_KEY. Details: {e}"
+            "Authentication failed against Open Dental. "
+            f"Verify OPENDENTAL_DEVELOPER_KEY and OPENDENTAL_CUSTOMER_KEY. Details: {e}"
         )
     if isinstance(e, OpenDentalNotFoundError):
         return f"Resource not found: {e}"
@@ -72,16 +74,16 @@ def _client() -> OpenDentalClient:
     return OpenDentalClient()
 
 
-# ----- Patient tools --------------------------------------------------------
-
-
 @mcp.tool()
 async def get_patient(patnum: int) -> str:
     """Fetch a single patient by PatNum (Open Dental's internal patient ID)."""
-    try:
-        return _json(await _client().get_patient(patnum))
-    except OpenDentalError:
-        raise
+    with audit_tool_call("get_patient", {"patnum": patnum}) as audit:
+        try:
+            out = _json(await _client().get_patient(patnum))
+            audit.set_result(out)
+            return out
+        except OpenDentalError:
+            raise
 
 
 @mcp.tool()
@@ -98,14 +100,26 @@ async def find_patients(
     At least one criterion must be provided. Use this to find a patient's
     PatNum before calling ``get_patient`` or other record-specific tools.
     """
-    try:
-        results = await _client().find_patients(
-            lname=lname, fname=fname, phone=phone, email=email,
-            birthdate=birthdate, limit=limit,
-        )
-        return _json({"count": len(results), "patients": results})
-    except OpenDentalError:
-        raise
+    with audit_tool_call(
+        "find_patients",
+        {
+            "lname": lname,
+            "fname": fname,
+            "phone": phone,
+            "email": email,
+            "birthdate": birthdate,
+            "limit": limit,
+        },
+    ) as audit:
+        try:
+            results = await _client().find_patients(
+                lname=lname, fname=fname, phone=phone, email=email, birthdate=birthdate, limit=limit
+            )
+            out = _json({"count": len(results), "patients": results})
+            audit.set_result(out)
+            return out
+        except OpenDentalError:
+            raise
 
 
 @mcp.tool()
@@ -116,18 +130,24 @@ async def update_patient(patnum: int, updates_json: str) -> str:
     ``'{"Email": "new@example.com", "WkPhone": "5551234567"}'``. Only fields
     included in the object will be modified.
     """
-    try:
-        updates = json.loads(updates_json)
-        if not isinstance(updates, dict):
-            return "updates_json must decode to a JSON object (e.g. '{}')."
-        return _json(await _client().update_patient(patnum, updates))
-    except json.JSONDecodeError as e:
-        return f"Invalid JSON in updates_json: {e}"
-    except OpenDentalError:
-        raise
-
-
-# ----- Appointment tools ----------------------------------------------------
+    with audit_tool_call(
+        "update_patient", {"patnum": patnum, "updates_json": updates_json}
+    ) as audit:
+        try:
+            updates = json.loads(updates_json)
+            if not isinstance(updates, dict):
+                out = "updates_json must decode to a JSON object (e.g. '{}')."
+                audit.set_result(out)
+                return out
+            out = _json(await _client().update_patient(patnum, updates))
+            audit.set_result(out)
+            return out
+        except json.JSONDecodeError as e:
+            out = f"Invalid JSON in updates_json: {e}"
+            audit.set_result(out)
+            return out
+        except OpenDentalError:
+            raise
 
 
 @mcp.tool()
@@ -145,23 +165,45 @@ async def find_appointments(
     Use ``date=YYYY-MM-DD`` for a single day, or ``date_start`` + ``date_end``
     for a range. Filter by ``patnum``, ``provnum``, or ``clinicnum``.
     """
-    try:
-        results = await _client().find_appointments(
-            date=date, date_start=date_start, date_end=date_end,
-            patnum=patnum, provnum=provnum, clinicnum=clinicnum, limit=limit,
-        )
-        return _json({"count": len(results), "appointments": results})
-    except OpenDentalError:
-        raise
+    with audit_tool_call(
+        "find_appointments",
+        {
+            "date": date,
+            "date_start": date_start,
+            "date_end": date_end,
+            "patnum": patnum,
+            "provnum": provnum,
+            "clinicnum": clinicnum,
+            "limit": limit,
+        },
+    ) as audit:
+        try:
+            results = await _client().find_appointments(
+                date=date,
+                date_start=date_start,
+                date_end=date_end,
+                patnum=patnum,
+                provnum=provnum,
+                clinicnum=clinicnum,
+                limit=limit,
+            )
+            out = _json({"count": len(results), "appointments": results})
+            audit.set_result(out)
+            return out
+        except OpenDentalError:
+            raise
 
 
 @mcp.tool()
 async def get_appointment(aptnum: int) -> str:
     """Fetch a single appointment by AptNum."""
-    try:
-        return _json(await _client().get_appointment(aptnum))
-    except OpenDentalError:
-        raise
+    with audit_tool_call("get_appointment", {"aptnum": aptnum}) as audit:
+        try:
+            out = _json(await _client().get_appointment(aptnum))
+            audit.set_result(out)
+            return out
+        except OpenDentalError:
+            raise
 
 
 @mcp.tool()
@@ -172,57 +214,70 @@ async def create_appointment(appointment_json: str) -> str:
     ``PatNum``, ``AptDateTime``, ``ProvNum``, ``Op``, ``AppointmentTypeNum``.
     See Open Dental API docs for the full schema.
     """
-    try:
-        data = json.loads(appointment_json)
-        if not isinstance(data, dict):
-            return "appointment_json must decode to a JSON object."
-        return _json(await _client().create_appointment(data))
-    except json.JSONDecodeError as e:
-        return f"Invalid JSON in appointment_json: {e}"
-    except OpenDentalError:
-        raise
-
-
-# ----- Provider / clinic tools ---------------------------------------------
+    with audit_tool_call("create_appointment", {"appointment_json": appointment_json}) as audit:
+        try:
+            data = json.loads(appointment_json)
+            if not isinstance(data, dict):
+                out = "appointment_json must decode to a JSON object."
+                audit.set_result(out)
+                return out
+            out = _json(await _client().create_appointment(data))
+            audit.set_result(out)
+            return out
+        except json.JSONDecodeError as e:
+            out = f"Invalid JSON in appointment_json: {e}"
+            audit.set_result(out)
+            return out
+        except OpenDentalError:
+            raise
 
 
 @mcp.tool()
 async def list_providers() -> str:
     """List all providers (dentists + hygienists) in the practice."""
-    try:
-        return _json(await _client().list_providers())
-    except OpenDentalError:
-        raise
+    with audit_tool_call("list_providers", {}) as audit:
+        try:
+            out = _json(await _client().list_providers())
+            audit.set_result(out)
+            return out
+        except OpenDentalError:
+            raise
 
 
 @mcp.tool()
 async def list_clinics() -> str:
     """List clinics (offices) accessible to this developer account."""
-    try:
-        return _json(await _client().list_clinics())
-    except OpenDentalError:
-        raise
+    with audit_tool_call("list_clinics", {}) as audit:
+        try:
+            out = _json(await _client().list_clinics())
+            audit.set_result(out)
+            return out
+        except OpenDentalError:
+            raise
 
 
 @mcp.tool()
 async def list_operatories(clinicnum: int | None = None) -> str:
     """List operatories (treatment rooms). Optionally filter by clinic number."""
-    try:
-        return _json(await _client().list_operatories(clinicnum=clinicnum))
-    except OpenDentalError:
-        raise
+    with audit_tool_call("list_operatories", {"clinicnum": clinicnum}) as audit:
+        try:
+            out = _json(await _client().list_operatories(clinicnum=clinicnum))
+            audit.set_result(out)
+            return out
+        except OpenDentalError:
+            raise
 
 
 @mcp.tool()
 async def list_appointment_types() -> str:
     """List appointment type definitions (cleaning, filling, exam, etc.)."""
-    try:
-        return _json(await _client().list_appointment_types())
-    except OpenDentalError:
-        raise
-
-
-# ----- Procedure tools ------------------------------------------------------
+    with audit_tool_call("list_appointment_types", {}) as audit:
+        try:
+            out = _json(await _client().list_appointment_types())
+            audit.set_result(out)
+            return out
+        except OpenDentalError:
+            raise
 
 
 @mcp.tool()
@@ -233,16 +288,19 @@ async def find_procedurelogs(
     limit: int = 50,
 ) -> str:
     """List procedure log entries (treatments performed). Filterable."""
-    try:
-        results = await _client().find_procedurelogs(
-            patnum=patnum, date_start=date_start, date_end=date_end, limit=limit,
-        )
-        return _json({"count": len(results), "procedurelogs": results})
-    except OpenDentalError:
-        raise
-
-
-# ----- Communication log tools ---------------------------------------------
+    with audit_tool_call(
+        "find_procedurelogs",
+        {"patnum": patnum, "date_start": date_start, "date_end": date_end, "limit": limit},
+    ) as audit:
+        try:
+            results = await _client().find_procedurelogs(
+                patnum=patnum, date_start=date_start, date_end=date_end, limit=limit
+            )
+            out = _json({"count": len(results), "procedurelogs": results})
+            audit.set_result(out)
+            return out
+        except OpenDentalError:
+            raise
 
 
 @mcp.tool()
@@ -265,21 +323,31 @@ async def log_communication(
       comm_mode: 1=None, 2=Phone, 3=Email, 4=TextMessage, 5=Mail
       sent_or_received: 0=Sent, 1=Received
     """
-    try:
-        result = await _client().create_commlog(
-            patnum=patnum,
-            comm_date=comm_datetime,
-            comm_type=comm_type,
-            note=note,
-            comm_mode=comm_mode,
-            sent_or_received=sent_or_received,
-        )
-        return _json({"status": "ok", "commlog": result})
-    except OpenDentalError:
-        raise
-
-
-# ----- Recall tools ---------------------------------------------------------
+    with audit_tool_call(
+        "log_communication",
+        {
+            "patnum": patnum,
+            "comm_datetime": comm_datetime,
+            "comm_type": comm_type,
+            "note": note,
+            "comm_mode": comm_mode,
+            "sent_or_received": sent_or_received,
+        },
+    ) as audit:
+        try:
+            result = await _client().create_commlog(
+                patnum=patnum,
+                comm_date=comm_datetime,
+                comm_type=comm_type,
+                note=note,
+                comm_mode=comm_mode,
+                sent_or_received=sent_or_received,
+            )
+            out = _json({"status": "ok", "commlog": result})
+            audit.set_result(out)
+            return out
+        except OpenDentalError:
+            raise
 
 
 @mcp.tool()
@@ -292,27 +360,42 @@ async def find_recalls(
 ) -> str:
     """List recalls due for patients. Use ``due_date_start`` + ``due_date_end``
     to get everyone due for a hygiene visit in a date window."""
-    try:
-        results = await _client().find_recalls(
-            patnum=patnum, due_date_start=due_date_start,
-            due_date_end=due_date_end, recall_type=recall_type, limit=limit,
-        )
-        return _json({"count": len(results), "recalls": results})
-    except OpenDentalError:
-        raise
-
-
-# ----- Health check ---------------------------------------------------------
+    with audit_tool_call(
+        "find_recalls",
+        {
+            "patnum": patnum,
+            "due_date_start": due_date_start,
+            "due_date_end": due_date_end,
+            "recall_type": recall_type,
+            "limit": limit,
+        },
+    ) as audit:
+        try:
+            results = await _client().find_recalls(
+                patnum=patnum,
+                due_date_start=due_date_start,
+                due_date_end=due_date_end,
+                recall_type=recall_type,
+                limit=limit,
+            )
+            out = _json({"count": len(results), "recalls": results})
+            audit.set_result(out)
+            return out
+        except OpenDentalError:
+            raise
 
 
 @mcp.tool()
 async def health_check() -> str:
     """Verify credentials are valid by hitting /providers (always accessible)."""
-    try:
-        await _client().list_providers()
-        return _json({"status": "ok"})
-    except OpenDentalError:
-        raise
+    with audit_tool_call("health_check", {}) as audit:
+        try:
+            await _client().list_providers()
+            out = _json({"status": "ok"})
+            audit.set_result(out)
+            return out
+        except OpenDentalError:
+            raise
 
 
 def main() -> None:
