@@ -1,5 +1,6 @@
 """Open Dental MCP — public surface."""
-__version__ = "0.2.0"
+
+__version__ = "0.4.0"
 
 from .client import OpenDentalClient
 from .exceptions import (

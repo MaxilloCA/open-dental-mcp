@@ -1,93 +1,102 @@
-"""Unit tests for the audit module (JSONL audit logger)."""
+"""Audit records must contain metadata only, even on failure."""
+
 from __future__ import annotations
 
+import asyncio
 import io
 import json
-import os
 from contextlib import redirect_stderr
+from pathlib import Path
+from typing import Any
 
 import pytest
 
-from open_dental_mcp.audit import _sanitize_args, audit_tool_call
+from open_dental_mcp.audit import audit_tool_call
 
 
-def test_sanitize_args_redacts_password() -> None:
-    sanitized = _sanitize_args({"username": "alice", "password": "hunter2"})
-    assert sanitized["username"] == "alice"
-    assert sanitized["password"] == "***REDACTED***"
-
-
-def test_sanitize_args_redacts_nested_secrets() -> None:
-    sanitized = _sanitize_args(
-        {"client": {"api_key": "abc123", "name": "acme"}, "token": "xyz"}
-    )
-    assert sanitized["client"]["api_key"] == "***REDACTED***"
-    assert sanitized["client"]["name"] == "acme"
-    assert sanitized["token"] == "***REDACTED***"
-
-
-def test_sanitize_args_truncates_long_strings() -> None:
-    long = "x" * 1000
-    sanitized = _sanitize_args({"body": long})
-    assert len(sanitized["body"]) == 256  # 253 + "..."
-
-
-def test_audit_tool_call_writes_jsonl_to_stderr() -> None:
-    """Default sink is stderr; one JSON object per line."""
-    buf = io.StringIO()
-    with redirect_stderr(buf), audit_tool_call("test_tool", {"query": "foo"}) as _:
-        _.set_result("hello")
-    line = buf.getvalue().strip()
-    assert line.endswith("}")
-    record = json.loads(line)
-    assert record["tool"] == "test_tool"
-    assert record["args"] == {"query": "foo"}
-    assert record["result_size"] == 5  # len("hello")
+def test_audit_omits_all_argument_keys_and_values_and_result(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    args: dict[str, Any] = {
+        "patient-secret-key": "Patient Example",
+        "patnum": 987654321,
+        "birthdate": "2008-09-10",
+        "phone": "555-123-0987",
+        "email": "private@example.invalid",
+        "nested": [{"Authorization": "ODFHIR secret/customer"}],
+        "unexpected": object(),
+    }
+    with audit_tool_call("find_patients", args) as audit:
+        audit.set_result("Clinical result: café")
+        assert not hasattr(audit, "args")
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    record = json.loads(captured.err)
+    assert set(record) == {
+        "ts",
+        "tool",
+        "request_id",
+        "argument_count",
+        "result_size",
+        "is_error",
+        "error_type",
+        "duration_ms",
+    }
+    assert record["argument_count"] == len(args)
+    assert record["result_size"] == len("Clinical result: café".encode())
     assert record["is_error"] is False
     assert record["error_type"] is None
-    assert isinstance(record["duration_ms"], int)
-    assert isinstance(record["request_id"], str)
-    assert "ts" in record
+    assert record["duration_ms"] >= 0
+    assert record["ts"].endswith("Z")
+    for secret in (*args.keys(), "Patient Example", "987654321", "ODFHIR", "Clinical result"):
+        assert secret not in captured.err
 
 
-def test_audit_tool_call_records_error() -> None:
-    """Tool errors are captured with is_error=True and exception class name."""
+@pytest.mark.parametrize("error", [RuntimeError("private clinical text"), asyncio.CancelledError()])
+def test_audit_errors_preserve_original_exception_and_emit_once(error: BaseException) -> None:
     buf = io.StringIO()
     with (
         redirect_stderr(buf),
-        pytest.raises(RuntimeError),
-        audit_tool_call("failing_tool", {"x": 1}) as _,
+        pytest.raises(type(error)) as caught,
+        audit_tool_call("failing_tool", {}),
     ):
-        raise RuntimeError("boom")
-    record = json.loads(buf.getvalue().strip())
-    assert record["tool"] == "failing_tool"
+        raise error
+    assert caught.value is error
+    lines = buf.getvalue().splitlines()
+    assert len(lines) == 1
+    record = json.loads(lines[0])
     assert record["is_error"] is True
-    assert record["error_type"] == "RuntimeError"
+    assert record["error_type"] == type(error).__name__
+    assert record["result_size"] is None
+    assert "private clinical text" not in buf.getvalue()
 
 
-def test_audit_tool_call_writes_to_file_when_env_set(tmp_path) -> None:
-    """OPEN_DENTAL_MCP_AUDIT_LOG overrides default sink to a file path."""
+def test_audit_ignores_legacy_file_sink(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     log_file = tmp_path / "audit.jsonl"
-    os.environ["OPEN_DENTAL_MCP_AUDIT_LOG"] = str(log_file)
-    try:
-        with audit_tool_call("file_tool", {"k": "v"}) as _:
-            _.set_result("ok")
-    finally:
-        os.environ.pop("OPEN_DENTAL_MCP_AUDIT_LOG", None)
-    line = log_file.read_text().strip()
-    record = json.loads(line)
-    assert record["tool"] == "file_tool"
-    assert record["result_size"] == 2
+    monkeypatch.setenv("OPEN_DENTAL_MCP_AUDIT_LOG", str(log_file))
+    buf = io.StringIO()
+    with redirect_stderr(buf), audit_tool_call("test_tool", {}) as audit:
+        audit.set_result("ok")
+    assert not log_file.exists()
+    assert json.loads(buf.getvalue())["tool"] == "test_tool"
 
 
-def test_audit_tool_call_never_breaks_tool_on_sink_failure() -> None:
-    """If writing to the sink fails, the tool still returns its result."""
-    # Point the env var to a path under a non-existent directory
-    os.environ["OPEN_DENTAL_MCP_AUDIT_LOG"] = "/nonexistent/dir/audit.jsonl"
-    try:
-        with audit_tool_call("x", {}) as _:
-            _.set_result("ok")
-            result = "tool returned this"
-        assert result == "tool returned this"
-    finally:
-        os.environ.pop("OPEN_DENTAL_MCP_AUDIT_LOG", None)
+class _BrokenSink(io.StringIO):
+    def write(self, text: str) -> int:
+        raise OSError("sink unavailable")
+
+
+def test_audit_sink_failure_preserves_result() -> None:
+    with redirect_stderr(_BrokenSink()), audit_tool_call("test_tool", {}) as audit:
+        audit.set_result("ok")
+
+
+def test_audit_sink_failure_preserves_original_error() -> None:
+    original = ValueError("patient detail")
+    with (
+        redirect_stderr(_BrokenSink()),
+        pytest.raises(ValueError, match="patient detail") as caught,
+        audit_tool_call("test_tool", {}),
+    ):
+        raise original
+    assert caught.value is original

@@ -1,182 +1,111 @@
-# open-dental-mcp
+# Open Dental MCP
 
-**Model Context Protocol (MCP) server for [Open Dental](https://www.opendental.com/)** — dental practice management software.
+A read-only Model Context Protocol (MCP) server for the Open Dental REST API.
+Use it from an MCP client to look up appointments, patients, procedures, and
+communication history. The server uses the documented API and exposes 12
+read tools.
 
-Talk to your Open Dental data from Claude, Cursor, or any MCP client. Read patients, appointments, providers, procedures, recalls. Write communications (phone calls, messages) back to patient charts.
+This is an independent MIT-licensed project based on
+[sanjibani/open-dental-mcp](https://github.com/sanjibani/open-dental-mcp).
+It is not affiliated with Open Dental Software.
 
-Built against the [Open Dental REST API](https://www.opendental.com/site/apispecification.html). No existing MCP for Open Dental — this is the first.
+## Quick start
 
----
+Requires Python 3.10+ and your own Open Dental developer and customer API keys.
+The development suite is verified on Windows with Python 3.13.
 
-## What you can do with it
-
-```
-You:   "Pull patient 4523 and show me their last 5 appointments + outstanding recalls."
-Claude: *calls get_patient, then find_appointments, then find_recalls*
-
-You:   "Find every recall due this month and draft a friendly reminder for each."
-Claude: *calls find_recalls with due_date window, drafts the messages*
-
-You:   "Just got off a call with the Smith family about rescheduling — log it."
-Claude: *calls log_communication with the right comm_type + comm_mode*
-
-You:   "What providers are working at clinic 2 tomorrow?"
-Claude: *calls list_providers + find_appointments, filters*
+```powershell
+git clone https://github.com/MaxilloCA/open-dental-mcp.git
+cd open-dental-mcp
+python -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -e .
+Copy-Item .env.example .env
 ```
 
-## Install
+Edit the new `.env` file with your credentials and choose an endpoint below.
+Use an API key with only the permissions your workflow needs. The key pair
+is required in all three modes. See [Open Dental API setup](https://www.opendental.com/site/apisetup.html)
+for prerequisites and permissions.
 
-```bash
-pip install -e .
+| Mode | `OPEN_DENTAL_BASE_URL` | Where the MCP runs |
+| --- | --- | --- |
+| Remote (default) | `https://api.opendental.com/api/v1/` | A machine that can reach the Remote API; the office needs a working eConnector |
+| Workstation Local API | `http://127.0.0.1:30222/api/v1/` | The same workstation as a running, signed-in Open Dental desktop instance |
+| API Service | `http://127.0.0.1:30223/api/v1/` | The same machine as the running API Service or compatible Open Dental Cloud Client |
+
+The [official API mode guide](https://www.opendental.com/site/apilocal.html)
+explains the distinction and Cloud Client support. In loopback modes, Open Dental
+can still contact its servers for credential validation. A VM, container, or
+remote agent has a different loopback interface from the Windows host.
+
+For example, to use the API Service:
+
+```dotenv
+OPEN_DENTAL_BASE_URL=http://127.0.0.1:30223/api/v1/
+OPENDENTAL_DEVELOPER_KEY=your-developer-key
+OPENDENTAL_CUSTOMER_KEY=your-customer-key
 ```
 
-## Configure
+Alternatively, replace both key lines with
+`OPEN_DENTAL_API_KEY=developer-key/customer-key`. The legacy base URL aliases
+`BASE_URL` and `OPENDENTAL_BASE_URL` are accepted in the credential file.
+If aliases are supplied together, they must agree. An explicitly selected
+credential file supplies the endpoint, defaulting to Remote if omitted.
 
-You need two API keys from Open Dental's [Developer Portal](https://api.opendental.com/portal):
+## Connect your MCP client
 
-1. **Developer API Key** — applies to your integration (you register via `vendor.relations@opendental.com`)
-2. **Customer API Key** — generated per-customer in the Developer Portal
+Choose **STDIO**. Use the absolute path to the virtual environment's Python
+executable as the command and pass these arguments separately:
 
-```bash
-export OPENDENTAL_DEVELOPER_KEY="..."
-export OPENDENTAL_CUSTOMER_KEY="..."
+```text
+-c
+from open_dental_mcp.server import main; main()
+--env-file
+<absolute path to your .env file>
 ```
 
-### Who uses this server?
+See [example client configuration](examples/mcp-client.json) for clients that
+use the `mcpServers` format. Replace its installation paths. On macOS/Linux,
+the virtual environment executable is typically `.venv/bin/python`; the API
+still needs to be reachable from that process. [Client setup](docs/CLIENT_SETUP.md)
+includes a connection check and troubleshooting.
 
-1. **Approved Open Dental API Partners** building tools for dental practices. Your developer key + customer keys work directly.
-2. **Dental practices / DSOs** doing custom integration work. Email `vendor.relations@opendental.com` to get set up.
-
-## Use with Claude Desktop
-
-Add to `~/Library/Application Support/Claude/claude_desktop_config.json`:
-
-```json
-{
-  "mcpServers": {
-    "open_dental_mcp": {
-      "command": "open_dental_mcp",
-      "env": {
-        "OPENDENTAL_DEVELOPER_KEY": "your-developer-key",
-        "OPENDENTAL_CUSTOMER_KEY": "your-customer-key"
-      }
-    }
-  }
-}
-```
+The client starts the MCP as a child process. The API address above is the
+upstream Open Dental endpoint; it is not the URL of an MCP server.
 
 ## Tools
 
-| Tool | Type | What it does |
-| --- | --- | --- |
-| `health_check` | Diagnostic | Verifies credentials |
-| `get_patient` | Read | Fetch a patient by PatNum |
-| `find_patients` | Read | Search by name / phone / email / DOB |
-| `update_patient` | Write | Patch patient fields |
-| `get_appointment` | Read | Fetch an appointment by AptNum |
-| `find_appointments` | Read | List appointments (by date / patient / provider) |
-| `create_appointment` | Write | Book a new appointment |
-| `list_providers` | Read | All providers in the practice |
-| `list_clinics` | Read | All clinics (offices) accessible |
-| `list_operatories` | Read | Treatment rooms |
-| `list_appointment_types` | Read | Cleaning / filling / exam definitions |
-| `find_procedurelogs` | Read | Treatments performed |
-| `log_communication` | Write | Log a phone call / email / message |
-| `find_recalls` | Read | Hygiene follow-up reminders |
-
-## Common patterns
-
-### Pre-visit brief
-
-```
-User:  I'm seeing patient 4523 at 2pm. Brief me.
-Agent: get_patient(patnum=4523)
-       find_appointments(patnum=4523, limit=5)
-       find_procedurelogs(patnum=4523, limit=10)
-       find_recalls(patnum=4523)
-       → Summary: patient info, last visits, what's been done, what's due
-```
-
-### Recall campaign
-
-```
-User:  Build this week's recall list and draft rebooking messages.
-Agent: find_recalls(due_date_start="2026-06-26", due_date_end="2026-07-03")
-       → for each: pull patient, draft a friendly message
-```
-
-### Post-call documentation
-
-```
-User:  Just took a call from the Smiths about rescheduling next week's cleaning.
-Agent: find_patients(lname="Smith", fname="...", phone="...")
-       log_communication(
-         patnum=<found>,
-         comm_datetime="2026-06-26T15:30:00",
-         comm_type=1,           # ApptRelated
-         comm_mode=2,           # Phone
-         sent_or_received=1,    # Received
-         note="Patient called to reschedule cleaning. Will call back with new date."
-       )
-```
-
-## API coverage
-
-| Open Dental endpoint | MCP tool |
+| Area | Tools |
 | --- | --- |
-| `GET /patients/{id}` | `get_patient` |
-| `GET /patients` | `find_patients` |
-| `PUT /patients/{id}` | `update_patient` |
-| `GET /appointments/{id}` | `get_appointment` |
-| `GET /appointments` | `find_appointments` |
-| `POST /appointments` | `create_appointment` |
-| `GET /providers` | `list_providers` |
-| `GET /clinics` | `list_clinics` |
-| `GET /operatories` | `list_operatories` |
-| `GET /appointmenttypes` | `list_appointment_types` |
-| `GET /procedurelogs` | `find_procedurelogs` |
-| `POST /commlogs` | `log_communication` |
-| `GET /recalls` | `find_recalls` |
+| Connection | `health_check` |
+| Patients | `get_patient`, `find_patients` |
+| Appointments | `get_appointment`, `find_appointments` |
+| Reference data | `list_providers`, `list_clinics`, `list_operatories`, `list_appointment_types` |
+| Patient history | `find_procedurelogs`, `find_commlogs`, `find_recalls` |
 
-Full Open Dental API: <https://www.opendental.com/site/apispecification.html>
+Start with `health_check`, then try `find_appointments` with a date in
+`YYYY-MM-DD` format. The health check tests one provider read; other tools
+may require additional permissions or a compatible Open Dental version.
+
+List calls return a page of up to 100 source rows. Follow `next_offset` with
+unchanged filters until it is `null`, even if a locally filtered page is empty.
+`count` is the number of matches on that page. A full page has
+`has_more: null` until another request confirms whether more rows exist.
+
+## Read-only design
+
+- The server exposes no write tools. The HTTP client also enforces GET and
+  checks the request path and parameters against an allowlist.
+- The three endpoint URLs above are the only supported destinations. No LAN
+  addresses, custom ports, redirects, automatic fallback, or environment proxies.
+- Audit logs contain request metadata. Tool responses can contain patient
+  information; use a client and workspace approved for your practice's data.
+- Communication notes are records to interpret. They do not authorize actions
+  or establish current illness, consent, or treatment clearance.
 
 ## Development
 
-```bash
-pip install -e ".[dev]"
-pytest
-open_dental_mcp
-```
-
-
----
-
-## Need a custom MCP for your SaaS?
-
-I build production-grade MCP servers for vertical SaaS — insurance, dental, veterinary, legal, property mgmt, home services. Typical engagement: 2-4 weeks, $25K-$120K. Source-owned, MIT-licensed, no vendor lock-in.
-
-See [sanjibani/mcp-services](https://github.com/sanjibani/mcp-services) or email sanjibani@users.noreply.github.com.
-
----
-
-*Ships in the [sanjibani vertical-MCP portfolio](https://github.com/sanjibani?q=-mcp) — see also [hawksoft-mcp](https://github.com/sanjibani/hawksoft-mcp), [open-dental-mcp](https://github.com/sanjibani/open-dental-mcp), [ezyvet-mcp](https://github.com/sanjibani/ezyvet-mcp), [jobber-mcp](https://github.com/sanjibani/jobber-mcp), [paid-skills](https://github.com/sanjibani/paid-skills), [mcp-vertical-template](https://github.com/sanjibani/mcp-vertical-template).*
-
----
-
-
-
-MIT — see [LICENSE](LICENSE).
-
-## Acknowledgements
-
-- Open Dental for the public REST API
-- Built using [mcp-vertical-template](https://github.com/sanjibani/mcp-vertical-template)
-- Inspired by [sanjibani/hawksoft-mcp](https://github.com/sanjibani/hawksoft-mcp) (insurance vertical, same pattern)
-
-## See also
-
-- [Open Dental API docs](https://www.opendental.com/site/apispecification.html)
-- [Open Dental Developer Portal](https://api.opendental.com/portal/gwt/fhirportal.html)
-- [Model Context Protocol](https://modelcontextprotocol.io)
-- [MCP Python SDK](https://github.com/modelcontextprotocol/python-sdk)
-- [More vertical MCPs from sanjibani](https://github.com/sanjibani?q=-mcp)
+See [CONTRIBUTING.md](CONTRIBUTING.md) for test commands,
+[CHANGELOG.md](CHANGELOG.md) for release changes, and
+[SECURITY.md](SECURITY.md) to report a security issue. Tests use fake
+credentials and mocked API responses. [MIT license](LICENSE).

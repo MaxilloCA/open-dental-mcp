@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "open_dental_readonly": {
+      "command": "C:\\path\\to\\open-dental-mcp\\.venv\\Scripts\\python.exe",
+      "args": [
+        "-c",
+        "from open_dental_mcp.server import main; main()",
+        "--env-file",
+        "C:\\path\\to\\open-dental-mcp\\.env"
+      ]
+    }
+  }
+}

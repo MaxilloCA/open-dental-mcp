@@ -20,6 +20,13 @@ wheels/
 *.egg
 
 .env
+.env.*
+!.env.example
+.omx/
+.hypothesis/
+.ruff_cache/
+.mypy_cache/
+artifacts/private/
 .venv
 env/
 venv/

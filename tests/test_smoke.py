@@ -2,10 +2,10 @@
 
 Built with ``respx`` (industry-standard httpx mocking) + ``pytest-asyncio``.
 """
+
 from __future__ import annotations
 
 import json
-import os
 from collections.abc import AsyncIterator
 from typing import Any
 
@@ -14,6 +14,7 @@ import pytest
 import respx
 from hypothesis import given, settings
 from hypothesis import strategies as st
+from mcp.server.fastmcp.exceptions import ToolError
 
 from open_dental_mcp import (
     OpenDentalAPIError,
@@ -23,6 +24,7 @@ from open_dental_mcp import (
     OpenDentalNotFoundError,
     OpenDentalRateLimitError,
 )
+from open_dental_mcp import server as _open_dental_mcp_server
 from open_dental_mcp.server import _format_error, _json
 
 # --- Fixtures --------------------------------------------------------------
@@ -46,17 +48,17 @@ async def client(monkeypatch: pytest.MonkeyPatch) -> AsyncIterator[OpenDentalCli
 # --- Client construction --------------------------------------------------
 
 
-def test_client_missing_credentials_raises() -> None:
+def test_client_missing_credentials_raises(monkeypatch: pytest.MonkeyPatch) -> None:
     for k in ("OPENDENTAL_DEVELOPER_KEY", "OPENDENTAL_CUSTOMER_KEY"):
-        os.environ.pop(k, None)
+        monkeypatch.delenv(k, raising=False)
     with pytest.raises(OpenDentalAuthError):
         OpenDentalClient()
 
 
-def test_client_uses_env_when_no_args(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_client_uses_env_when_no_args(monkeypatch: pytest.MonkeyPatch) -> None:
     _env(monkeypatch)
-    client = OpenDentalClient()
-    assert client._auth_header == "ODFHIR dev-key/cust-key"
+    async with OpenDentalClient() as client:
+        assert client._auth_header == "ODFHIR dev-key/cust-key"
 
 
 @pytest.mark.asyncio
@@ -141,13 +143,16 @@ async def test_429_includes_retry_after(client: OpenDentalClient) -> None:
 
 @pytest.mark.asyncio
 @respx.mock
-async def test_500_captures_request_id(client: OpenDentalClient) -> None:
+async def test_500_omits_untrusted_request_id_and_body(client: OpenDentalClient) -> None:
     respx.get("https://api.opendental.com/api/v1/providers").mock(
         return_value=httpx.Response(500, headers={"x-request-id": "req-abc"}, text="boom")
     )
     with pytest.raises(OpenDentalAPIError) as exc_info:
         await client.list_providers()
-    assert exc_info.value.request_id == "req-abc"
+    assert exc_info.value.request_id is None
+    assert exc_info.value.body is None
+    assert "req-abc" not in str(exc_info.value)
+    assert "boom" not in str(exc_info.value)
 
 
 @pytest.mark.asyncio
@@ -196,29 +201,19 @@ async def test_5xx_eventually_succeeds_after_retry(client: OpenDentalClient) -> 
 
 @pytest.mark.asyncio
 @respx.mock
-async def test_create_commlog_uses_post(client: OpenDentalClient) -> None:
-    route = respx.post("https://api.opendental.com/api/v1/commlogs").mock(
-        return_value=httpx.Response(201, json={"CommlogNum": 99})
-    )
-    result = await client.create_commlog(
-        patnum=12345, comm_date="2026-01-15T10:30:00", comm_type=1, note="Called re: appointment"
-    )
-    assert result["CommlogNum"] == 99
-    assert route.calls[0].request.method == "POST"
-    body = json.loads(route.calls[0].request.content)
-    assert body["PatNum"] == 12345
-    assert body["CommType"] == 1
-    assert body["Note"] == "Called re: appointment"
+async def test_write_methods_are_absent(client: OpenDentalClient) -> None:
+    for name in ("create_commlog", "update_patient", "create_appointment"):
+        assert not hasattr(client, name)
+    assert not respx.calls
 
 
 @pytest.mark.asyncio
 @respx.mock
-async def test_update_patient_uses_put(client: OpenDentalClient) -> None:
-    route = respx.put("https://api.opendental.com/api/v1/patients/1").mock(
-        return_value=httpx.Response(200, json={"PatNum": 1, "FName": "Updated"})
-    )
-    await client.update_patient(1, {"FName": "Updated"})
-    assert route.calls[0].request.method == "PUT"
+@pytest.mark.parametrize("method", ["POST", "PUT", "PATCH", "DELETE"])
+async def test_write_requests_blocked_before_http(client: OpenDentalClient, method: str) -> None:
+    with pytest.raises(ValueError, match="Read-only policy"):
+        await client._request(method, "/patients/1", json={"FName": "Updated"})
+    assert not respx.calls
 
 
 # --- Property-based test --------------------------------------------------
@@ -261,6 +256,7 @@ def test_format_error_connection_says_network() -> None:
 def test_format_error_generic() -> None:
     msg = _format_error(ValueError("nope"))
     assert "Unexpected" in msg
+    assert "nope" not in msg
 
 
 def test_error_repr_includes_structured_fields() -> None:
@@ -269,7 +265,6 @@ def test_error_repr_includes_structured_fields() -> None:
     assert "http_status=500" in r
     assert "error_code='oops'" in r
     assert "request_id='req-1'" in r
-
 
 
 # --- Security regression: tools must raise (not return string) so FastMCP ---
@@ -285,11 +280,11 @@ def test_error_repr_includes_structured_fields() -> None:
 
 @pytest.mark.asyncio
 @respx.mock
-async def test_tool_error_sets_iserror_true() -> None:
+async def test_tool_error_sets_iserror_true(monkeypatch: pytest.MonkeyPatch) -> None:
     """FastMCP must wrap the raised exception → sets isError=true over the wire."""
     # Set up creds for client construction
-    os.environ["OPENDENTAL_DEVELOPER_KEY"] = "dev"
-    os.environ["OPENDENTAL_CUSTOMER_KEY"] = "cust"
+    monkeypatch.setenv("OPENDENTAL_DEVELOPER_KEY", "dev")
+    monkeypatch.setenv("OPENDENTAL_CUSTOMER_KEY", "cust")
 
     # Mock the OAuth refresh (if applicable) + a failing API call
 
@@ -297,15 +292,11 @@ async def test_tool_error_sets_iserror_true() -> None:
         return_value=httpx.Response(401, text="")
     )
 
-    from mcp.server.fastmcp.exceptions import ToolError
-
-    from open_dental_mcp import server as _open_dental_mcp_server
-
     with pytest.raises(ToolError) as exc_info:
         await _open_dental_mcp_server.mcp.call_tool("list_providers", {})
 
     msg = str(exc_info.value)
-    assert "Open Dental rejected the credentials" in msg, (
+    assert "Open Dental rejected the credentials or API permissions" in msg, (
         f"Expected auth hint in the error; got: {msg!r}. "
         "Returning error strings as plain content (the OLD pattern) loses "
         "isError=true and the agent cannot tell the tool failed."
